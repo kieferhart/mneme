@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Hermes plugin: multi-process Kuzu lock contention.** The plugin used to
+  hold a long-lived Kuzu connection, which locked out any other hermes
+  process (gateway vs. TUI vs. cron) trying to use the same DB. It now
+  opens and closes the connection per operation, with bounded
+  exponential-backoff retry on lock collisions (defaults: 20 attempts,
+  ~37s max wait). Pairwise rewards are skipped from the plugin path
+  because they outlive the lock window; run them via the `mneme` CLI.
+
 ## [0.1.0] — 2026-04-27
 
 Initial release.

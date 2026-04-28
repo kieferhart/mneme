@@ -16,16 +16,26 @@ Configuration in ``$HERMES_HOME/config.yaml``::
         prefetch_top_n: 5
         prefetch_mode: balanced
         traverse_on_prefetch: false          # hop traversal is heavier
+        lock_retry_attempts: 5
+        lock_retry_initial_delay: 0.2
 
 Activation requires ``mneme`` to be importable in hermes's Python environment::
 
     /path/to/hermes/venv/bin/pip install mneme
+
+Concurrency note: Kuzu uses an exclusive file lock per database. The plugin
+opens and closes a connection per operation (with bounded retry on lock
+collision) so multiple hermes processes — gateway, TUI, cron — can share the
+same database without permanently locking each other out.
 """
 
 from __future__ import annotations
 
+import contextlib
+import gc
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -138,14 +148,35 @@ def _expand(value: str, hermes_home: str) -> str:
 # ---------------------------------------------------------------------------
 
 class MnemeProvider(MemoryProvider):
-    """Hermes memory provider backed by Mneme's Kuzu graph."""
+    """Hermes memory provider backed by Mneme's Kuzu graph.
+
+    Connections are opened and closed per operation so multiple hermes
+    processes (gateway, TUI, cron) can share the same DB without permanently
+    locking each other out. Lock collisions are retried with exponential
+    backoff (see :meth:`_open_db`).
+    """
+
+    # Default retry budget. ~37s max wait, generous enough to cover an LLM
+    # call holding the lock in another hermes process (apply_citation_rewards
+    # waits on a remote completion that can take 5–10s).
+    _LOCK_MAX_DELAY = 2.0
+    _LOCK_DEFAULT_ATTEMPTS = 20
+    _LOCK_DEFAULT_INITIAL_DELAY = 0.2
 
     def __init__(self, config: Optional[dict] = None):
         self._config = config or _load_plugin_config()
-        self._conn = None
         self._db_path: Optional[str] = None
         self._session_id: Optional[str] = None
         self._available: Optional[bool] = None
+
+    def _retry_budget(self) -> tuple[int, float]:
+        """Read retry params from current config (re-read each open so config
+        edits take effect without a hermes restart)."""
+        attempts = int(self._config.get("lock_retry_attempts",
+                                        self._LOCK_DEFAULT_ATTEMPTS))
+        initial = float(self._config.get("lock_retry_initial_delay",
+                                         self._LOCK_DEFAULT_INITIAL_DELAY))
+        return attempts, initial
 
     @property
     def name(self) -> str:
@@ -185,30 +216,72 @@ class MnemeProvider(MemoryProvider):
         db_path = _expand(self._config.get("db_path", default_db), hermes_home)
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
-
-        import kuzu
-        from mneme.schema import init_schema
-
-        db = kuzu.Database(db_path)
-        self._db = db  # keep a reference so the GC doesn't collect the DB handle
-        self._conn = kuzu.Connection(db)
-        init_schema(self._conn)
         self._session_id = session_id
 
+        # Eagerly run the schema once; subsequent connections inherit it.
+        try:
+            with self._open_db() as (_, conn):
+                from mneme.schema import init_schema
+                init_schema(conn)
+        except Exception as exc:
+            logger.warning("mneme: initial schema check failed: %s", exc)
+
     def shutdown(self) -> None:
-        self._conn = None
-        self._db = None
+        # Nothing to release — connections are scoped to each call.
+        return None
+
+    # -- connection helper --------------------------------------------------
+
+    @contextlib.contextmanager
+    def _open_db(self):
+        """Open a Kuzu DB + connection, retrying on lock collisions.
+
+        Releases the lock as soon as the ``with`` block exits — both objects
+        are dropped and ``gc.collect()`` runs to force Kuzu's destructor.
+        Backoff doubles each attempt up to ``_LOCK_MAX_DELAY``.
+        """
+        import kuzu
+
+        attempts, delay = self._retry_budget()
+        last_err: Optional[Exception] = None
+        for attempt in range(attempts):
+            try:
+                db = kuzu.Database(self._db_path)
+                conn = kuzu.Connection(db)
+                try:
+                    yield db, conn
+                finally:
+                    del conn
+                    del db
+                    gc.collect()
+                return
+            except RuntimeError as exc:
+                msg = str(exc).lower()
+                if "lock" in msg or "exclusive" in msg:
+                    last_err = exc
+                    if attempt < attempts - 1:
+                        time.sleep(min(delay, self._LOCK_MAX_DELAY))
+                        delay = min(delay * 2, self._LOCK_MAX_DELAY)
+                    continue
+                raise
+        raise RuntimeError(
+            f"mneme: could not acquire database lock at {self._db_path} after "
+            f"{attempts} attempts; another process is holding it. "
+            f"Last error: {last_err}"
+        )
 
     # -- prompt + recall ----------------------------------------------------
 
     def system_prompt_block(self) -> str:
-        if not self._conn:
+        if not self._db_path:
             return ""
         try:
-            res = self._conn.execute("MATCH (m:Memory) RETURN COUNT(*) AS n")
-            n = res.get_next()[0] if res.has_next() else 0
-        except Exception:
-            n = 0
+            with self._open_db() as (_, conn):
+                res = conn.execute("MATCH (m:Memory) RETURN COUNT(*) AS n")
+                n = res.get_next()[0] if res.has_next() else 0
+        except Exception as exc:
+            logger.debug("mneme system_prompt_block failed: %s", exc)
+            return ""
         if n == 0:
             return (
                 "# Mneme\n"
@@ -228,41 +301,37 @@ class MnemeProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if not self._conn or not query:
+        if not self._db_path or not query:
             return ""
         top_n = int(self._config.get("prefetch_top_n", 5))
         traverse_on_prefetch = bool(self._config.get("traverse_on_prefetch", False))
         mode = str(self._config.get("prefetch_mode", "balanced"))
         try:
             from mneme.traverse import find_candidate_nodes, traverse
-            candidates = find_candidate_nodes(self._conn, query, top_n=top_n)
+            with self._open_db() as (_, conn):
+                candidates = find_candidate_nodes(conn, query, top_n=top_n)
+                lines = ["## Mneme recall"]
+                for c in candidates:
+                    score = c.get("overlap_score", 0)
+                    title = c.get("title", "?")
+                    summary = (c.get("summary") or c.get("body") or "")[:200]
+                    lines.append(f"- [{score:.2f}] **{title}** — {summary}")
+
+                if traverse_on_prefetch and candidates:
+                    start = candidates[0]
+                    path_res = traverse(
+                        conn, start["id"], query,
+                        mode=mode, max_hops=int(self._config.get("max_hops", 3)),
+                    )
+                    path_titles = [n.get("title", "?") for n in path_res.get("path", [])]
+                    if len(path_titles) > 1:
+                        lines.append("")
+                        lines.append("Path: " + " → ".join(path_titles))
         except Exception as exc:
             logger.debug("mneme prefetch failed: %s", exc)
             return ""
         if not candidates:
             return ""
-
-        lines = ["## Mneme recall"]
-        for c in candidates:
-            score = c.get("overlap_score", 0)
-            title = c.get("title", "?")
-            summary = (c.get("summary") or c.get("body") or "")[:200]
-            lines.append(f"- [{score:.2f}] **{title}** — {summary}")
-
-        if traverse_on_prefetch:
-            try:
-                start = candidates[0]
-                path_res = traverse(
-                    self._conn, start["id"], query,
-                    mode=mode, max_hops=int(self._config.get("max_hops", 3)),
-                )
-                path_titles = [n.get("title", "?") for n in path_res.get("path", [])]
-                if len(path_titles) > 1:
-                    lines.append("")
-                    lines.append("Path: " + " → ".join(path_titles))
-            except Exception as exc:
-                logger.debug("mneme traversal in prefetch failed: %s", exc)
-
         return "\n".join(lines)
 
     # -- tools --------------------------------------------------------------
@@ -273,7 +342,7 @@ class MnemeProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if tool_name != "mneme":
             return tool_error(f"Unknown tool: {tool_name}")
-        if not self._conn:
+        if not self._db_path:
             return tool_error("mneme provider not initialized")
 
         action = args.get("action")
@@ -303,13 +372,14 @@ class MnemeProvider(MemoryProvider):
 
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[Dict[str, Any]] = None) -> None:
-        if action != "add" or not self._conn or not content:
+        if action != "add" or not self._db_path or not content:
             return
         try:
             from mneme.memory import add_memory
             kind = "user_pref" if target == "user" else "memory_note"
             title = (content.splitlines()[0] or content)[:80].strip() or "untitled"
-            add_memory(self._conn, title=title, body=content, kind=kind)
+            with self._open_db() as (_, conn):
+                add_memory(conn, title=title, body=content, kind=kind)
         except Exception as exc:
             logger.debug("mneme on_memory_write failed: %s", exc)
 
@@ -327,6 +397,12 @@ class MnemeProvider(MemoryProvider):
             {"key": "traverse_on_prefetch",
              "description": "Walk the graph during prefetch (heavier)",
              "default": "false", "choices": ["true", "false"]},
+            {"key": "lock_retry_attempts",
+             "description": "Retries when another process holds the DB",
+             "default": "5"},
+            {"key": "lock_retry_initial_delay",
+             "description": "Initial backoff seconds (doubles each retry)",
+             "default": "0.2"},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -351,7 +427,8 @@ class MnemeProvider(MemoryProvider):
         title = args["title"]
         body = args.get("body", "")
         kind = args.get("kind", "note")
-        result = add_memory(self._conn, title=title, body=body, kind=kind)
+        with self._open_db() as (_, conn):
+            result = add_memory(conn, title=title, body=body, kind=kind)
         return tool_result({
             "id": result["id"], "title": result["title"], "kind": result["kind"],
             "summary": result.get("summary"),
@@ -361,40 +438,41 @@ class MnemeProvider(MemoryProvider):
         from mneme.memory import link_memories
         kind = args.get("kind", "relates_to")
         kind = "relates_to" if kind == "relates_to" else "analogous_to"
-        result = link_memories(
-            self._conn,
-            args["source"], args["target"],
-            kind=kind,
-            reason=args.get("reason", ""),
-        )
+        with self._open_db() as (_, conn):
+            result = link_memories(
+                conn, args["source"], args["target"],
+                kind=kind, reason=args.get("reason", ""),
+            )
         return tool_result(result)
 
     def _do_ask(self, args: dict) -> str:
         from mneme.traverse import find_candidate_nodes, traverse
         from mneme.session import create_session, log_session_edges
-        from mneme.learn import apply_citation_rewards, apply_pairwise_rewards
+        from mneme.learn import apply_citation_rewards
         query = args["query"]
         mode = args.get("mode", "balanced")
         max_hops = int(args.get("max_hops", 3))
-        candidates = find_candidate_nodes(self._conn, query, top_n=5)
-        if not candidates:
-            return tool_result({"path": [], "candidates": [],
-                                "note": "no memories matched the query"})
 
-        session = create_session(self._conn, user_query=query, mode=mode)
-        path_res = traverse(self._conn, candidates[0]["id"], query,
-                            mode=mode, max_hops=max_hops)
-        try:
-            log_session_edges(self._conn, session["id"], path_res)
-        except Exception as exc:
-            logger.debug("log_session_edges failed: %s", exc)
+        with self._open_db() as (_, conn):
+            candidates = find_candidate_nodes(conn, query, top_n=5)
+            if not candidates:
+                return tool_result({"path": [], "candidates": [],
+                                    "note": "no memories matched the query"})
 
-        citation = apply_citation_rewards(self._conn, path_res["path"],
-                                          path_res["edges"], query)
-        try:
-            apply_pairwise_rewards(self._conn, path_res, query, mode=mode)
-        except Exception:
-            pass
+            session = create_session(conn, user_query=query, mode=mode)
+            path_res = traverse(conn, candidates[0]["id"], query,
+                                mode=mode, max_hops=max_hops)
+            try:
+                log_session_edges(conn, session["id"], path_res)
+            except Exception as exc:
+                logger.debug("log_session_edges failed: %s", exc)
+
+            # Citation rewards run synchronously inside the same lock window.
+            # Pairwise rewards (async) are intentionally skipped from the plugin
+            # path: they would otherwise outlive the lock window and race the
+            # next caller. Run pairwise via the mneme CLI if you want it.
+            citation = apply_citation_rewards(conn, path_res["path"],
+                                              path_res["edges"], query)
 
         return tool_result({
             "session_id": session["id"],
@@ -420,7 +498,8 @@ class MnemeProvider(MemoryProvider):
 
     def _do_show(self, args: dict) -> str:
         from mneme.memory import show_memory
-        result = show_memory(self._conn, args["title"])
+        with self._open_db() as (_, conn):
+            result = show_memory(conn, args["title"])
         if not result:
             return tool_error(f"Memory not found: {args['title']}")
         return tool_result({
@@ -444,7 +523,8 @@ class MnemeProvider(MemoryProvider):
 
     def _do_neighbors(self, args: dict) -> str:
         from mneme.memory import get_neighbors
-        edges = get_neighbors(self._conn, args["title"])
+        with self._open_db() as (_, conn):
+            edges = get_neighbors(conn, args["title"])
         return tool_result({
             "title": args["title"],
             "edges": [
@@ -464,17 +544,18 @@ class MnemeProvider(MemoryProvider):
         from mneme.memory import get_neighbors
         source = args["source"]
         target = args["target"]
-        rel_table = "RELATES_TO"
-        for n in get_neighbors(self._conn, source):
-            if n.get("target_title") == target:
-                kind = str(n.get("kind", "")).lower()
-                rel_table = "ANALOGOUS_TO" if "analog" in kind else "RELATES_TO"
-                break
-        result = reward_edge(
-            self._conn, source, target, rel_table,
-            weight_field=args.get("weight_field", "accuracy_weight"),
-            amount=float(args.get("amount", 3.0)),
-        )
+        with self._open_db() as (_, conn):
+            rel_table = "RELATES_TO"
+            for n in get_neighbors(conn, source):
+                if n.get("target_title") == target:
+                    kind = str(n.get("kind", "")).lower()
+                    rel_table = "ANALOGOUS_TO" if "analog" in kind else "RELATES_TO"
+                    break
+            result = reward_edge(
+                conn, source, target, rel_table,
+                weight_field=args.get("weight_field", "accuracy_weight"),
+                amount=float(args.get("amount", 3.0)),
+            )
         return tool_result(result)
 
     def _do_suggest_links(self, args: dict) -> str:
@@ -483,19 +564,20 @@ class MnemeProvider(MemoryProvider):
         titles = args.get("titles", [])
         if not titles:
             return tool_error("suggest_links requires 'titles' list")
-        path = []
-        existing: list[dict] = []
-        for t in titles:
-            mem = find_memory_by_title(self._conn, t)
-            if not mem:
-                continue
-            path.append(mem)
-            for e in get_neighbors(self._conn, t):
-                existing.append({"source_title": t,
-                                 "target_title": e.get("target_title")})
         threshold = float(args.get("threshold", 0.05))
-        suggestions = suggest_new_links(path, existing, threshold=threshold,
-                                        conn=self._conn)
+        with self._open_db() as (_, conn):
+            path = []
+            existing: list[dict] = []
+            for t in titles:
+                mem = find_memory_by_title(conn, t)
+                if not mem:
+                    continue
+                path.append(mem)
+                for e in get_neighbors(conn, t):
+                    existing.append({"source_title": t,
+                                     "target_title": e.get("target_title")})
+            suggestions = suggest_new_links(path, existing, threshold=threshold,
+                                            conn=conn)
         return tool_result({"suggestions": suggestions, "count": len(suggestions)})
 
 

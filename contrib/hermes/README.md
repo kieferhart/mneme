@@ -96,7 +96,35 @@ If LLM vars are unset, `ask` still works — it just doesn't reinforce edges
 automatically. Mneme will also auto-load `~/.config/mneme.env` at import time
 if present, so you can put the LLM config there.
 
-## Caveats
+## Concurrency: multi-process access
+
+Kuzu uses an **exclusive file lock** per database — only one process can hold
+it open at a time. If you run more than one hermes process (e.g. `gateway`
+plus `--tui`), naively keeping a long-lived connection in either process
+locks the other one out completely.
+
+The plugin sidesteps this by **opening and closing the connection per
+operation**, with bounded exponential-backoff retry on lock collisions:
+
+| Config key | Default | Purpose |
+|---|---|---|
+| `lock_retry_attempts` | `20` | Max times to retry on a lock error |
+| `lock_retry_initial_delay` | `0.2` | Starting backoff (seconds, doubles each retry, capped at 2.0s) |
+
+Total max wait under defaults: ~37 seconds. That's enough to survive a
+sibling process holding the lock during a remote LLM call inside
+`apply_citation_rewards` (5–10s typical). If you hit "could not acquire
+database lock" errors regularly, tune `lock_retry_attempts` higher in
+`config.yaml`.
+
+### Pairwise rewards skipped from the plugin path
+
+Mneme's pairwise judging fires asynchronously in a worker thread. The plugin
+intentionally skips it because the worker would outlive the lock window and
+race the next caller. If you want pairwise running, drive `mneme ask` from
+the CLI instead.
+
+## Other caveats
 
 - **First load downloads the embedding model** (~80MB).
 - **One external memory provider at a time.** Switching from another provider
