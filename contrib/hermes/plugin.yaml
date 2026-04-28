@@ -1,0 +1,6 @@
+name: mneme
+version: 0.1.0
+description: "Mneme — local Kuzu-backed memory graph with sentence-transformer embeddings, weighted edges, and citation-grounded reinforcement."
+hooks:
+  - on_memory_write
+  - on_session_end
